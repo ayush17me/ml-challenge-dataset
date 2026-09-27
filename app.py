@@ -2,14 +2,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from sklearn.feature_extraction.text import TfidfVectorizer
+from gensim.models import FastText
 from sklearn.neighbors import NearestNeighbors
 from sklearn.decomposition import PCA
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Entity Clustering Visualizer", layout="wide")
 st.title("🔍 Entity Resolution: Blocking & Clustering Visualizer")
-st.markdown("Visualizing how TF-IDF and Nearest Neighbors group similar businesses together.")
+st.markdown("Visualizing how **FastText** and Nearest Neighbors group similar businesses together.")
 
 # --- 1. MOCK DATA GENERATION (Since we are using a sample) ---
 # To make this runnable immediately, we create a small, realistic mock sample.
@@ -54,29 +54,44 @@ df_s1, df_cand = load_sample_data()
 # Combine for clustering visualization
 df_all = pd.concat([df_s1, df_cand], ignore_index=True)
 
-# --- 2. TF-IDF & DIMENSIONALITY REDUCTION ---
+# --- 2. FASTTEXT & DIMENSIONALITY REDUCTION ---
 st.sidebar.header("⚙️ Clustering Parameters")
-ngram_min = st.sidebar.slider("N-gram Min", 2, 4, 3)
-ngram_max = st.sidebar.slider("N-gram Max", 3, 6, 4)
+vector_size = st.sidebar.slider("Vector Size", 10, 100, 50)
+epochs = st.sidebar.slider("Training Epochs", 10, 200, 100)
 
-with st.spinner("Computing TF-IDF and PCA..."):
-    # 1. TF-IDF Vectorization (Character level to catch typos)
-    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(ngram_min, ngram_max))
-    tfidf_matrix = vectorizer.fit_transform(df_all['business_name'].str.lower())
+with st.spinner("Training FastText model and computing PCA..."):
+    # 1. FastText Vectorization
+    # Tokenize the business names
+    tokenized_data = df_all['business_name'].str.lower().str.split().tolist()
+    
+    # Train FastText model on our data (handles typos via subwords!)
+    ft_model = FastText(sentences=tokenized_data, vector_size=vector_size, window=3, min_count=1, epochs=epochs)
+    
+    # Function to get document vector by averaging word vectors
+    def get_doc_vector(doc):
+        tokens = doc.lower().split()
+        if not tokens:
+            return np.zeros(vector_size)
+        vecs = [ft_model.wv[word] for word in tokens if word in ft_model.wv]
+        if not vecs:
+            return np.zeros(vector_size)
+        return np.mean(vecs, axis=0)
+
+    # Get vectors for all entities
+    fasttext_matrix = np.array([get_doc_vector(name) for name in df_all['business_name']])
     
     # 2. PCA for 2D Visualization
-    # TF-IDF creates hundreds of dimensions. We squish it to 2D to plot it on a screen.
     pca = PCA(n_components=2)
-    pca_coords = pca.fit_transform(tfidf_matrix.toarray())
+    pca_coords = pca.fit_transform(fasttext_matrix)
     
     df_all['PCA_X'] = pca_coords[:, 0]
     df_all['PCA_Y'] = pca_coords[:, 1]
 
 # --- 3. INTERACTIVE VISUALIZATION ---
-st.subheader("🌌 2D Cluster Map (PCA of TF-IDF)")
+st.subheader("🌌 2D Cluster Map (PCA of FastText Embeddings)")
 st.markdown("""
-Every dot is a business. The closer two dots are, the more similar their names are. 
-*Notice how the typos (e.g., 'Target' and 'Targt') cluster near each other.*
+Every dot is a business. The closer two dots are, the more similar their names are in the embedding space. 
+*FastText uses subword (character n-gram) information, making it robust against typos like 'Targt' and 'Wallmart'.*
 """)
 
 fig = px.scatter(
@@ -92,7 +107,6 @@ fig = px.scatter(
 fig.update_traces(marker=dict(size=10, opacity=0.8, line=dict(width=1, color='DarkSlateGrey')))
 st.plotly_chart(fig, use_container_width=True)
 
-
 # --- 4. NEAREST NEIGHBORS (THE ACTUAL BLOCKING) ---
 st.divider()
 st.subheader("🤖 Test the Blocking Algorithm")
@@ -101,15 +115,16 @@ st.subheader("🤖 Test the Blocking Algorithm")
 selected_s1_name = st.selectbox("Select a Source 1 Reference Business:", df_s1['business_name'].tolist())
 selected_s1_idx = df_s1[df_s1['business_name'] == selected_s1_name].index[0]
 
-# Fit NearestNeighbors ONLY on the candidates (Step 2 pipeline)
-cand_tfidf = vectorizer.transform(df_cand['business_name'].str.lower())
-s1_tfidf = vectorizer.transform([selected_s1_name.lower()])
+# Generate FastText vectors for Candidates and the Source 1 query
+cand_matrix = np.array([get_doc_vector(name) for name in df_cand['business_name']])
+s1_vector = get_doc_vector(selected_s1_name).reshape(1, -1)
 
 k_neighbors = st.slider("How many candidates to retrieve? (K)", 1, 10, 3)
 
+# Use cosine distance for FastText embeddings
 nn = NearestNeighbors(n_neighbors=k_neighbors, metric='cosine')
-nn.fit(cand_tfidf)
-distances, indices = nn.kneighbors(s1_tfidf)
+nn.fit(cand_matrix)
+distances, indices = nn.kneighbors(s1_vector)
 
 # Fetch the results
 col1, col2 = st.columns(2)
@@ -128,4 +143,4 @@ with col2:
         results.append({"Candidate ID": match_id, "Candidate Name": match_name, "Cosine Distance": round(dist, 4)})
     
     st.dataframe(pd.DataFrame(results), use_container_width=True)
-    st.caption("Lower Cosine Distance = More Similar. If distance > 0.8, you'd usually reject it!")
+    st.caption("Lower Cosine Distance = More Similar.")
